@@ -8,7 +8,6 @@
 import Foundation
 import LocalAuthentication
 
-
 typealias StorageCallback = (Any?) -> Void
 typealias StorageError = (String, String?, Any?) -> Any
 
@@ -50,6 +49,7 @@ class BiometricStorageImpl {
     self.storageMethodNotImplemented = storageMethodNotImplemented
   }
   
+  private var stores: [String: BiometricStorageFile] = [:]
   private let storageError: StorageError
   private let storageMethodNotImplemented: Any
 
@@ -59,104 +59,72 @@ class BiometricStorageImpl {
 
   public func handle(_ call: StorageMethodCall, result: @escaping StorageCallback) {
     
-    func requiredArg<T>(_ key: String, _ cb: (T) -> Void) {
+    func requiredArg<T>(_ name: String, _ cb: (T) -> Void) {
       guard let args = call.arguments as? Dictionary<String, Any> else {
         result(storageError(code: "InvalidArguments", message: "Invalid arguments \(String(describing: call.arguments))", details: nil))
         return
       }
-      guard let value = args[key] else {
-        result(storageError(code: "InvalidArguments", message: "Missing argument \(key)", details: nil))
+      guard let value = args[name] else {
+        result(storageError(code: "InvalidArguments", message: "Missing argument \(name)", details: nil))
         return
       }
       guard let valueTyped = value as? T else {
-        result(storageError(code: "InvalidArguments", message: "Invalid argument for \(key): expected \(T.self) got \(value)", details: nil))
+        result(storageError(code: "InvalidArguments", message: "Invalid argument for \(name): expected \(T.self) got \(value)", details: nil))
         return
       }
       cb(valueTyped)
       return
     }
+    func requireStorage(_ name: String, _ cb: (BiometricStorageFile) -> Void) {
+      guard let file = stores[name] else {
+        result(storageError(code: "InvalidArguments", message: "Storage was not initialized \(name)", details: nil))
+        return
+      }
+      cb(file)
+    }
     
     if ("canAuthenticate" == call.method) {
-        canAuthenticate(result: result)
+      canAuthenticate(result: result)
     } else if ("init" == call.method) {
-//        canAuthenticate(result: result)
-//       _ =  KeychainManager.shared.encrypt(name: "DUYQK11", publicKey: "DUYQK")
-        BiometricAuthManager.shared.authenticateWithBiometrics { r, err in
-            result(r)
+      requiredArg("name") { name in
+        requiredArg("options") { options in
+          stores[name] = BiometricStorageFile(name: name, initOptions: InitOptions(params: options), storageError: storageError)
         }
+      }
+      result(true)
     } else if ("dispose" == call.method) {
-      
+      // nothing to dispose
       result(true)
     } else if ("read" == call.method) {
-        requiredArg("name") { name  in
-            requiredArg("content") { value in
-                showBiometricVerify { success, err in
-                    if success {
-                        let resultValue = CryptographyManager.shared.decrypt(secretKeyName: name, value: value)
-                         result(resultValue)
-                    } else {
-                        return result(nil)
-                    }
-                }
-            }
+      requiredArg("name") { name in
+        requiredArg("iosPromptInfo") { promptInfo in
+          requireStorage(name) { file in
+            file.read(result, IOSPromptInfo(params: promptInfo))
+          }
         }
+      }
     } else if ("write" == call.method) {
-        requiredArg("name") { name  in
-            requiredArg("content") { value in
-                showBiometricVerify { success, err in
-                    if success {
-                        let resultValue = CryptographyManager.shared.encrypt(secretKeyName: name, plainText: value)
-                         result(resultValue)
-                    } else {
-                        return result(nil)
-                    }
-                }
+      requiredArg("name") { name in
+        requiredArg("content") { content in
+          requiredArg("iosPromptInfo") { promptInfo in
+            requireStorage(name) { file in
+              file.write(content, result, IOSPromptInfo(params: promptInfo))
             }
+          }
         }
+      }
     } else if ("delete" == call.method) {
-        requiredArg("name") { name  in
-            CryptographyManager.shared.delete(secretKeyName: name)
+      requiredArg("name") { name in
+        requiredArg("iosPromptInfo") { promptInfo in
+          requireStorage(name) { file in
+            file.delete(result, IOSPromptInfo(params: promptInfo))
+          }
         }
+      }
     } else {
       result(storageMethodNotImplemented)
     }
   }
-    
-    private func showBiometricVerify(callBack : @escaping (_ success : Bool, _ err : Error?) -> Void) {
-        let biometricManager = BiometricAuthManager.shared
-        biometricManager.authenticateWithBiometrics { success, error in
-            
-            callBack(success, error)
-            if success {
-                
-            } else if let error = error {
-                // Handle authentication failure or errors
-                // For example, show an error message to the user
-                print("Biometric authentication failed with error: \(error.localizedDescription)")
-            } else {
-                // Biometric authentication was canceled or failed
-                // Handle the case where the user cancels or the authentication fails
-                print("Biometric authentication was canceled or failed")
-            }
-        }
-    }
-    
-    private func handleOSStatusError(_ status: OSStatus, _ result: @escaping StorageCallback, _ message: String) {
-        var errorMessage: String? = nil
-        if #available(iOS 11.3, OSX 10.12, *) {
-          errorMessage = SecCopyErrorMessageString(status, nil) as String?
-        }
-        let code: String
-        switch status {
-        case errSecUserCanceled:
-          code = "AuthError:UserCanceled"
-        default:
-          code = "SecurityError"
-        }
-        
-        result(storageError(code, "Error while \(message): \(status): \(errorMessage ?? "Unknown")", nil))
-      }
-
   
 
   private func canAuthenticate(result: @escaping StorageCallback) {
@@ -192,56 +160,196 @@ class BiometricStorageImpl {
 
 typealias StoredContext = (context: LAContext, expireAt: Date)
 
+class BiometricStorageFile {
+  private let name: String
+  private let initOptions: InitOptions
+  private var _context: StoredContext?
+  private var context: LAContext {
+    get {
+      if let context = _context {
+        if context.expireAt.timeIntervalSinceNow < 0 {
+          // already expired.
+          _context = nil
+        } else {
+          return context.context
+        }
+      }
+      
+      let context = LAContext()
+      if (initOptions.authenticationRequired) {
+        if let duration = initOptions.darwinTouchIDAuthenticationAllowableReuseDuration {
+          if #available(OSX 10.12, *) {
+            context.touchIDAuthenticationAllowableReuseDuration = Double(duration)
+          } else {
+            // Fallback on earlier versions
+            hpdebug("Pre OSX 10.12 no touchIDAuthenticationAllowableReuseDuration available. ignoring.")
+          }
+        }
+        
+        if let duration = initOptions.darwinTouchIDAuthenticationForceReuseContextDuration {
+          _context = (context: context, expireAt: Date(timeIntervalSinceNow: Double(duration)))
+        }
+      }
+      return context
+    }
+  }
+  private let storageError: StorageError
 
-class BiometricAuthManager {
-    static let shared = BiometricAuthManager()
+  init(name: String, initOptions: InitOptions, storageError: @escaping StorageError) {
+    self.name = name
+    self.initOptions = initOptions
+    self.storageError = storageError
+  }
+  
+  private func baseQuery(_ result: @escaping StorageCallback) -> [String: Any]? {
+//      let access = SecAccessControlCreateWithFlags(nil, kSecAttrAccessibleWhenUnlockedThisDeviceOnly,.privateKeyUsage,nil)
+      var query = [
+          kSecClass as String: kSecClassGenericPassword,
+          kSecAttrService as String: "flutter_biometric_storage",
+          kSecAttrAccount as String: name,
+//          kSecAttrAccessControl as String: access!,
+        ] as [String : Any]
+      if initOptions.authenticationRequired {
+          guard let access = accessControl(result) else {
+              return nil
+          }
+          if #available(iOS 13.0, macOS 10.15, *) {
+              query[kSecUseDataProtectionKeychain as String] = true
+          }
+          query[kSecAttrAccessControl as String] = access
+      }
+      return query
+  }
+  
+  private func accessControl(_ result: @escaping StorageCallback) -> SecAccessControl? {
+    let accessControlFlags: SecAccessControlCreateFlags
     
-    // UserDefaults key for the switch state
-    private let biometricSwitchKey = "biometricSwitchState"
+    if initOptions.darwinBiometricOnly {
+      if #available(iOS 11.3, *) {
+        accessControlFlags =  .biometryCurrentSet
+      } else {
+        accessControlFlags = .touchIDCurrentSet
+      }
+    } else {
+      accessControlFlags = .userPresence
+    }
+        
+//      access = SecAccessControlCreateWithFlags(nil,
+//                                               kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
+//                                               accessControlFlags,
+//                                               &error)
+    var error: Unmanaged<CFError>?
+    guard let access = SecAccessControlCreateWithFlags(
+      nil, // Use the default allocator.
+      kSecAttrAccessibleWhenPasscodeSetThisDeviceOnly,
+      accessControlFlags,
+      &error) else {
+      hpdebug("Error while creating access control flags. \(String(describing: error))")
+      result(storageError("writing data", "error writing data", "\(String(describing: error))"));
+      return nil
+    }
+
+    return access
+  }
+  
+  func read(_ result: @escaping StorageCallback, _ promptInfo: IOSPromptInfo) {
+
+    guard var query = baseQuery(result) else {
+      return;
+    }
+    query[kSecMatchLimit as String] = kSecMatchLimitOne
+    query[kSecUseOperationPrompt as String] = promptInfo.accessTitle
+    query[kSecReturnAttributes as String] = true
+    query[kSecReturnData as String] = true
+    query[kSecUseAuthenticationContext as String] = context
     
-    private init() {}
+    var item: CFTypeRef?
     
-    // Function to set the state of the biometric switch
-    func setBiometricSwitchState(isOn: Bool) {
-        UserDefaults.standard.set(isOn, forKey: biometricSwitchKey)
+    let status = SecItemCopyMatching(query as CFDictionary, &item)
+    guard status != errSecItemNotFound else {
+      result(nil)
+      return
+    }
+    guard status == errSecSuccess else {
+      handleOSStatusError(status, result, "Error retrieving item. \(status)")
+      return
+    }
+    guard let existingItem = item as? [String : Any],
+      let data = existingItem[kSecValueData as String] as? Data,
+      let dataString = String(data: data, encoding: String.Encoding.utf8)
+      else {
+        result(storageError("RetrieveError", "Unexpected data.", nil))
+        return
+    }
+    result(dataString)
+  }
+  
+  func delete(_ result: @escaping StorageCallback, _ promptInfo: IOSPromptInfo) {
+    guard let query = baseQuery(result) else {
+      return;
+    }
+    //    query[kSecMatchLimit as String] = kSecMatchLimitOne
+    //    query[kSecReturnData as String] = true
+    let status = SecItemDelete(query as CFDictionary)
+    if status == errSecSuccess {
+      result(true)
+      return
+    }
+    if status == errSecItemNotFound {
+      hpdebug("Item not in keychain. Nothing to delete.")
+      result(true)
+      return
+    }
+    handleOSStatusError(status, result, "writing data")
+  }
+  
+  func write(_ content: String, _ result: @escaping StorageCallback, _ promptInfo: IOSPromptInfo) {
+    guard var query = baseQuery(result) else {
+      return;
+    }
+
+    if (initOptions.authenticationRequired) {
+      query.merge([
+        kSecUseAuthenticationContext as String: context,
+      ]) { (_, new) in new }
+      if let operationPrompt = promptInfo.saveTitle {
+        query[kSecUseOperationPrompt as String] = operationPrompt
+      }
+    } else {
+      hpdebug("No authentication required for \(name)")
+    }
+    query.merge([
+      //      kSecMatchLimit as String: kSecMatchLimitOne,
+      kSecValueData as String: content.data(using: String.Encoding.utf8) as Any,
+    ]) { (_, new) in new }
+    var status = SecItemAdd(query as CFDictionary, nil)
+    if (status == errSecDuplicateItem) {
+      hpdebug("Value already exists. updating.")
+      let update = [kSecValueData as String: query[kSecValueData as String]]
+      query.removeValue(forKey: kSecValueData as String)
+      status = SecItemUpdate(query as CFDictionary, update as CFDictionary)
+    }
+    guard status == errSecSuccess else {
+      handleOSStatusError(status, result, "writing data")
+      return
+    }
+    result(nil)
+  }
+  
+  private func handleOSStatusError(_ status: OSStatus, _ result: @escaping StorageCallback, _ message: String) {
+    var errorMessage: String? = nil
+    if #available(iOS 11.3, OSX 10.12, *) {
+      errorMessage = SecCopyErrorMessageString(status, nil) as String?
+    }
+    let code: String
+    switch status {
+    case errSecUserCanceled:
+      code = "AuthError:UserCanceled"
+    default:
+      code = "SecurityError"
     }
     
-    // Function to get the state of the biometric switch
-    func isBiometricSwitchOn() -> Bool {
-        return UserDefaults.standard.bool(forKey: biometricSwitchKey)
-    }
-    
-    func canUseBiometricAuthentication() -> Bool {
-        let context = LAContext()
-        var error: NSError?
-        return context.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: &error)
-    }
-    func getBiometricType() -> LABiometryType {
-        let context = LAContext()
-        return context.biometryType
-    }
-    func authenticateWithBiometrics(completion: @escaping (Bool, Error?) -> Void) {
-        let context = LAContext()
-        context.evaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, localizedReason: "Authenticate using Face ID or Touch ID") { success, error in
-            DispatchQueue.main.async {
-                completion(success, error)
-            }
-        }
-    }
-    func showBiometricsSettingsAlert(_ controller: UIViewController) {
-        let alertController = UIAlertController(
-            title: "Enable Face ID/Touch ID",
-            message: "To use biometric authentication, you need to enable Face ID/Touch ID for this app in your device settings.",
-            preferredStyle: .alert
-        )
-        let settingsAction = UIAlertAction(title: "Go to Settings", style: .default) { _ in
-            if let settingsURL = URL(string: UIApplication.openSettingsURLString) {
-                UIApplication.shared.open(settingsURL, options: [:], completionHandler: nil)
-            }
-        }
-        alertController.addAction(settingsAction)
-        let cancelAction = UIAlertAction(title: "Cancel", style: .cancel, handler: nil)
-        alertController.addAction(cancelAction)
-        controller.present(alertController, animated: true, completion: nil)
-    }
+    result(storageError(code, "Error while \(message): \(status): \(errorMessage ?? "Unknown")", nil))
+  }
+  
 }

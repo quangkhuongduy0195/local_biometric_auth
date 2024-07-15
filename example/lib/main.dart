@@ -51,7 +51,7 @@ class _ExampleScreenState extends State<ExampleScreen> {
   }
 
   Future<CanAuthenticateResponse> _checkAuthenticate() async {
-    final response = await LocalBiometricAuth().canAuthenticate();
+    final response = await BiometricStorage().canAuthenticate();
     _logger.info('checked if authentication was possible: $response');
     return response;
   }
@@ -60,7 +60,7 @@ class _ExampleScreenState extends State<ExampleScreen> {
   final TextEditingController _writeController =
       TextEditingController(text: 'Lorem Ipsum');
 
-  BiometricStorage? _authStorage;
+  BiometricStorageFile? _authStorage;
   static String data = '';
 
   @override
@@ -82,7 +82,9 @@ class _ExampleScreenState extends State<ExampleScreen> {
                     'Unable to use authenticate. Unable to get storage.');
                 return;
               }
-              _authStorage = await LocalBiometricAuth().init("auth");
+              _authStorage = await BiometricStorage().getStorage(
+                  '${baseName}_authenticated',
+                  options: StorageFileInitOptions());
               _logger.info('initiailzed $baseName');
             },
           ),
@@ -97,9 +99,16 @@ class _ExampleScreenState extends State<ExampleScreen> {
                         child: const Text('read'),
                         onPressed: () async {
                           try {
-                            final result =
-                                await _authStorage?.decryptData(data);
-                            _logger.info('read: {$result}');
+                            final canAuthenticate =
+                                await BiometricStorage().canAuthenticate();
+                            if (canAuthenticate !=
+                                CanAuthenticateResponse.success) {
+                              _logger.severe('Unable to authenticate');
+                              return;
+                            }
+                            final result = await _authStorage?.read();
+                            _logger
+                                .info('read: {$result} - ${canAuthenticate}');
                           } on AuthException catch (e) {
                             _logger.info(e.code);
                           }
@@ -110,9 +119,9 @@ class _ExampleScreenState extends State<ExampleScreen> {
                         onPressed: () async {
                           _logger.fine('Going to write...');
                           try {
-                            data = await _authStorage?.encryptData(
-                                    '[${DateTime.now()}] DuyQK') ??
-                                '';
+                            await _authStorage?.write(
+                              ' [${DateTime.now()}] DuyQK',
+                            );
                             _logger.info('Written content.');
                           } on AuthException catch (e) {
                             _logger.info(e.code);

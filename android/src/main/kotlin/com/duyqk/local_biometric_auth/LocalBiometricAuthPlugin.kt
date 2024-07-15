@@ -1,19 +1,17 @@
 package com.duyqk.local_biometric_auth
 
-import CryptographyManager
 import android.app.Activity
 import android.content.Context
 import android.os.*
-import android.util.Base64
-import android.util.Log
+import android.security.keystore.KeyPermanentlyInvalidatedException
+import android.security.keystore.UserNotAuthenticatedException
 import androidx.annotation.AnyThread
+import androidx.annotation.RequiresApi
 import androidx.annotation.UiThread
 import androidx.annotation.WorkerThread
 import androidx.biometric.*
 import androidx.biometric.BiometricManager.Authenticators.*
-import androidx.core.content.ContextCompat
 import androidx.fragment.app.FragmentActivity
-//import androidx.fragment.app.FragmentActivity
 import io.flutter.embedding.engine.plugins.FlutterPlugin
 import io.flutter.embedding.engine.plugins.activity.*
 import io.flutter.plugin.common.*
@@ -22,12 +20,10 @@ import io.flutter.plugin.common.MethodChannel.Result
 import io.github.oshai.kotlinlogging.KotlinLogging
 import java.io.PrintWriter
 import java.io.StringWriter
-import java.nio.Buffer
-import java.nio.charset.Charset
-import java.security.SecureRandom
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
-
+import javax.crypto.Cipher
+import kotlin.time.Duration.Companion.seconds
 
 private val logger = KotlinLogging.logger {}
 
@@ -36,20 +32,12 @@ enum class CipherMode {
   Decrypt,
 }
 
-data class AndroidPromptInfo(
-  val title: String,
-  val subtitle: String?,
-  val description: String?,
-  val negativeButton: String,
-  val confirmationRequired: Boolean
-)
-
 typealias ErrorCallback = (errorInfo: AuthenticationErrorInfo) -> Unit
 
 class MethodCallException(
-  val errorCode: String,
-  val errorMessage: String?,
-  val errorDetails: Any? = null
+    val errorCode: String,
+    val errorMessage: String?,
+    val errorDetails: Any? = null
 ) : Exception(errorMessage ?: errorCode)
 
 @Suppress("unused")
@@ -79,164 +67,215 @@ enum class AuthenticationError(vararg val code: Int) {
   ;
 
   companion object {
-    fun forCode(code: Int) =
-      values().firstOrNull { it.code.contains(code) } ?: Unknown
+    fun forCode(code: Int) = values().firstOrNull { it.code.contains(code) } ?: Unknown
   }
 }
 
 data class AuthenticationErrorInfo(
-  val error: AuthenticationError,
-  val message: CharSequence,
-  val errorDetails: String? = null
+    val error: AuthenticationError,
+    val message: CharSequence,
+    val errorDetails: String? = null
 ) {
   constructor(
-    error: AuthenticationError,
-    message: CharSequence,
-    e: Throwable
+      error: AuthenticationError,
+      message: CharSequence,
+      e: Throwable
   ) : this(error, message, e.toCompleteString())
 }
 
 private fun Throwable.toCompleteString(): String {
-  val out = StringWriter().let { out ->
-    printStackTrace(PrintWriter(out))
-    out.toString()
-  }
+  val out =
+      StringWriter().let { out ->
+        printStackTrace(PrintWriter(out))
+        out.toString()
+      }
   return "$this\n$out"
 }
 
-
 /** LocalBiometricAuthPlugin */
-class LocalBiometricAuthPlugin: FlutterPlugin, ActivityAware, MethodCallHandler {
-
+class LocalBiometricAuthPlugin : FlutterPlugin, ActivityAware, MethodCallHandler {
   companion object {
     const val PARAM_NAME = "name"
     const val PARAM_WRITE_CONTENT = "content"
     const val PARAM_ANDROID_PROMPT_INFO = "androidPromptInfo"
   }
-  private var secretKeyName = "biometric_encryption_key"
+
   private val executor: ExecutorService by lazy { Executors.newSingleThreadExecutor() }
   private val handler: Handler by lazy { Handler(Looper.getMainLooper()) }
+
   private var attachedActivity: FragmentActivity? = null
+
+  private val storageFiles = mutableMapOf<String, BiometricStorageFile>()
+
   private val biometricManager by lazy { BiometricManager.from(applicationContext) }
 
   private lateinit var applicationContext: Context
-  private lateinit var channel : MethodChannel
-//  private lateinit var biometricPrompt: BiometricPrompt
-  private lateinit var cryptographyManager: CryptographyManager
-  private var readyToEncrypt: Boolean = false
-//  private lateinit var ciphertext:ByteArray
 
   override fun onAttachedToEngine(flutterPluginBinding: FlutterPlugin.FlutterPluginBinding) {
     this.applicationContext = flutterPluginBinding.applicationContext
-    channel = MethodChannel(flutterPluginBinding.binaryMessenger, "local_biometric_auth")
+    val channel = MethodChannel(flutterPluginBinding.binaryMessenger, "local_biometric_auth")
     channel.setMethodCallHandler(this)
-    cryptographyManager = CryptographyManager()
   }
-
   override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
-    channel.setMethodCallHandler(null)
     executor.shutdown()
   }
 
+  @RequiresApi(Build.VERSION_CODES.M)
   override fun onMethodCall(call: MethodCall, result: Result) {
     logger.trace { "onMethodCall(${call.method})" }
     try {
       fun <T> requiredArgument(name: String) =
-        call.argument<T>(name) ?: throw MethodCallException(
-          "MissingArgument",
-          "Missing required argument '$name'"
-        )
+          call.argument<T>(name)
+              ?: throw MethodCallException("MissingArgument", "Missing required argument '$name'")
 
       // every method call requires the name of the stored file.
       val getName = { requiredArgument<String>(PARAM_NAME) }
       val getAndroidPromptInfo = {
         requiredArgument<Map<String, Any>>(PARAM_ANDROID_PROMPT_INFO).let {
           AndroidPromptInfo(
-            title = it["title"] as String,
-            subtitle = it["subtitle"] as String?,
-            description = it["description"] as String?,
-            negativeButton = it["negativeButton"] as String,
-            confirmationRequired = it["confirmationRequired"] as Boolean,
+              title = it["title"] as String,
+              subtitle = it["subtitle"] as String?,
+              description = it["description"] as String?,
+              negativeButton = it["negativeButton"] as String,
+              confirmationRequired = it["confirmationRequired"] as Boolean,
           )
         }
       }
 
-
+      fun withStorage(cb: BiometricStorageFile.() -> Unit) {
+        val name = getName()
+        storageFiles[name]?.apply(cb)
+            ?: run {
+              logger.warn { "User tried to access storage '$name', before initialization" }
+              result.error("Storage $name was not initialized.", null, null)
+              return
+            }
+      }
 
       val resultError: ErrorCallback = { errorInfo ->
         result.error(
-          "AuthError:${errorInfo.error}",
-          errorInfo.message.toString(),
-          errorInfo.errorDetails
+            "AuthError:${errorInfo.error}",
+            errorInfo.message.toString(),
+            errorInfo.errorDetails
         )
         logger.error { "AuthError: $errorInfo" }
+      }
 
+      @UiThread
+      fun BiometricStorageFile.withAuth(
+          mode: CipherMode,
+          @WorkerThread cb: BiometricStorageFile.(cipher: Cipher?) -> Unit
+      ) {
+        if (!options.authenticationRequired) {
+          return cb(null)
+        }
+
+        fun cipherForMode() =
+            when (mode) {
+              CipherMode.Encrypt -> cipherForEncrypt()
+              CipherMode.Decrypt -> cipherForDecrypt()
+            }
+
+        val cipher =
+            try {
+              cipherForMode()
+            } catch (e: KeyPermanentlyInvalidatedException) {
+              // TODO should we communicate this to the caller?
+              logger.warn(e) { "Key was invalidated. removing previous storage and recreating." }
+              deleteFile()
+              // if deleting fails, simply throw the second time around.
+              cipherForMode()
+            }
+
+        if (cipher == null) {
+          // if we have no cipher, just try the callback and see if the
+          // user requires authentication.
+          try {
+            return cb(null)
+          } catch (e: UserNotAuthenticatedException) {
+            logger.debug(e) { "User requires (re)authentication. showing prompt ..." }
+          }
+        }
+
+        val promptInfo = getAndroidPromptInfo()
+        authenticate(cipher, promptInfo, options, { cb(cipher) }, onError = resultError)
       }
 
       when (call.method) {
-        "getPlatformVersion" -> result.success("Android ${android.os.Build.VERSION.RELEASE}")
         "canAuthenticate" -> result.success(canAuthenticate().name)
         "init" -> {
-          secretKeyName = requiredArgument<String>(PARAM_NAME)
-          result.success(canAuthenticate() == CanAuthenticateResponse.Success)
-        }
-        "dispose" -> {}
-        "read" -> {
-          val canAuth = canAuthenticate()
-          if(canAuth == CanAuthenticateResponse.Success) {
-            secretKeyName = requiredArgument<String>(PARAM_NAME)
-            readyToEncrypt = false
-//          if (BiometricManager.from(applicationContext).canAuthenticate(BiometricManager.Authenticators.BIOMETRIC_WEAK) == BiometricManager
-//              .BIOMETRIC_SUCCESS)
-              val data = requiredArgument<String>(PARAM_WRITE_CONTENT)
-              val ciphertext = Base64.decode(data, Base64.DEFAULT)
-
-              val iv = ByteArray(16)
-              System.arraycopy(ciphertext, 0, iv, 0, 16)
-              val cipher = cryptographyManager.getInitializedCipherForDecryption(secretKeyName,iv)
-              val biometricPrompt = createBiometricPrompt(data, result)
-
-              if(biometricPrompt !=null) {
-                val promptInfo = createPromptInfo(getAndroidPromptInfo())
-                biometricPrompt.authenticate(promptInfo, BiometricPrompt.CryptoObject(cipher))
-              } else {
-                result.error("biometric_fail", "fail", "")
-              }
-          } else {
-            result.success(canAuth.name)
+          val name = getName()
+          if (storageFiles.containsKey(name)) {
+            if (call.argument<Boolean>("forceInit") == true) {
+              throw MethodCallException(
+                  "AlreadyInitialized",
+                  "A storage file with the name '$name' was already initialized."
+              )
+            } else {
+              result.success(false)
+              return
+            }
           }
 
-        }
-        "delete" -> {
-          cryptographyManager.delete(secretKeyName)
+          val options =
+              call.argument<Map<String, Any>>("options")?.let {
+                InitOptions(
+                    androidAuthenticationValidityDuration =
+                        (it["androidAuthenticationValidityDurationSeconds"] as Int?)?.seconds,
+                    authenticationRequired = it["authenticationRequired"] as Boolean,
+                    androidBiometricOnly = it["androidBiometricOnly"] as Boolean,
+                )
+              }
+                  ?: InitOptions()
+          //                    val options = moshi.adapter(InitOptions::class.java)
+          //                        .fromJsonValue(call.argument("options") ?: emptyMap<String,
+          // Any>())
+          //                        ?: InitOptions()
+          storageFiles[name] = BiometricStorageFile(applicationContext, name, options)
           result.success(true)
         }
-        "write" ->{
-          val canAuth = canAuthenticate()
-          if(canAuth == CanAuthenticateResponse.Success) {
-            readyToEncrypt = true
-            secretKeyName = requiredArgument<String>(PARAM_NAME)
-//          if (BiometricManager.from(applicationContext).canAuthenticate() == BiometricManager
-//              .BIOMETRIC_SUCCESS)
-
-              val iv = ByteArray(16)
-              val secureRandom = SecureRandom()
-              secureRandom.nextBytes(iv)
-
-
-              val cipher = cryptographyManager.getInitializedCipherForEncryption(secretKeyName, iv)
-              val password = requiredArgument<String>(PARAM_WRITE_CONTENT)
-              val biometricPrompt = createBiometricPrompt(password, result)
-              if (biometricPrompt != null) {
-                val promptInfo = createPromptInfo(getAndroidPromptInfo())
-                biometricPrompt.authenticate(promptInfo, BiometricPrompt.CryptoObject(cipher))
+        "dispose" ->
+            storageFiles.remove(getName())?.apply {
+              dispose()
+              result.success(true)
+            }
+                ?: throw MethodCallException(
+                    "NoSuchStorage",
+                    "Tried to dispose non existing storage.",
+                    null
+                )
+        "read" ->
+            withStorage {
+              if (exists()) {
+                withAuth(CipherMode.Decrypt) {
+                  val ret =
+                      readFile(
+                          it,
+                      )
+                  ui(resultError) { result.success(ret) }
+                }
               } else {
-                result.success(CanAuthenticateResponse.ErrorStatusUnknown)
+                result.success(null)
               }
-          } else {
-            result.success(canAuth.name)
+            }
+        "delete" ->
+            withStorage {
+              if (exists()) {
+                result.success(deleteFile())
+              } else {
+                result.success(false)
+              }
+            }
+        "write" ->
+            withStorage {
+              withAuth(CipherMode.Encrypt) {
+                writeFile(it, requiredArgument(PARAM_WRITE_CONTENT))
+                ui(resultError) { result.success(true) }
+              }
+            }
+          "checkBiometric" -> {
+
           }
-        }
         else -> result.notImplemented()
       }
     } catch (e: MethodCallException) {
@@ -248,62 +287,46 @@ class LocalBiometricAuthPlugin: FlutterPlugin, ActivityAware, MethodCallHandler 
     }
   }
 
-  private fun createBiometricPrompt(password: String, result: MethodChannel.Result): BiometricPrompt? {
-    val executor = ContextCompat.getMainExecutor(applicationContext)
-
-    val callback = object : BiometricPrompt.AuthenticationCallback() {
-      override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
-        super.onAuthenticationError(errorCode, errString)
-//        if(errorCode == 7){
-//          result.error("AuthError:Block", errString.toString(), null)
-//        } else {
-//          result.error("AuthError:$errorCode", errString.toString(), null)
-//        }
-
-        result.success(null)
+  @AnyThread
+  private inline fun ui(
+      @UiThread crossinline onError: ErrorCallback,
+      @UiThread crossinline cb: () -> Unit
+  ) =
+      handler.post {
+        try {
+          cb()
+        } catch (e: Throwable) {
+          logger.error(e) { "Error while calling UI callback. This must not happen." }
+          onError(
+              AuthenticationErrorInfo(
+                  AuthenticationError.Unknown,
+                  "Unexpected authentication error. ${e.localizedMessage}",
+                  e
+              )
+          )
+        }
       }
 
-      override fun onAuthenticationFailed() {
-        super.onAuthenticationFailed()
-//        result.error("error", null, null)
+  private inline fun worker(
+      @UiThread crossinline onError: ErrorCallback,
+      @WorkerThread crossinline cb: () -> Unit
+  ) =
+      executor.submit {
+        try {
+          cb()
+        } catch (e: Throwable) {
+          logger.error(e) { "Error while calling worker callback. This must not happen." }
+          handler.post {
+            onError(
+                AuthenticationErrorInfo(
+                    AuthenticationError.Unknown,
+                    "Unexpected authentication error. ${e.localizedMessage}",
+                    e
+                )
+            )
+          }
+        }
       }
-
-      override fun onAuthenticationSucceeded(biometricResult: BiometricPrompt.AuthenticationResult) {
-        super.onAuthenticationSucceeded(biometricResult)
-          val value = processData(biometricResult.cryptoObject, password)
-          result.success(value)
-      }
-    }
-
-    //The API requires the client/Activity context for displaying the prompt view
-    if(attachedActivity != null) {
-      val biometricPrompt = attachedActivity?.let { BiometricPrompt(it, executor, callback) }
-      return biometricPrompt
-    }
-    return null
-  }
-
-  private fun processData(cryptoObject: BiometricPrompt.CryptoObject?, password : String) : String {
-    val data = if (readyToEncrypt) {
-      val encryptedData = password.let { cryptographyManager.encryptData(it, cryptoObject?.cipher!!) }
-      val ciphertext = encryptedData.ciphertext
-      Base64.encodeToString(ciphertext, Base64.DEFAULT);
-    } else {
-      val ciphertext = Base64.decode(password, Base64.DEFAULT)
-      cryptographyManager.decryptData(ciphertext, cryptoObject?.cipher!!)
-    }
-    return  data
-  }
-
-  private fun createPromptInfo(promptInfo: AndroidPromptInfo): BiometricPrompt.PromptInfo {
-    return BiometricPrompt.PromptInfo.Builder()
-      .setTitle(promptInfo.title)
-      .setSubtitle(promptInfo.subtitle)
-      .setDescription(promptInfo.description)
-      .setConfirmationRequired(false)
-      .setNegativeButtonText("Use Account Password")
-      .build()
-  }
 
   private fun canAuthenticate(): CanAuthenticateResponse {
     val credentialsResponse = biometricManager.canAuthenticate(DEVICE_CREDENTIAL)
@@ -312,17 +335,99 @@ class LocalBiometricAuthPlugin: FlutterPlugin, ActivityAware, MethodCallHandler 
       return CanAuthenticateResponse.ErrorNoBiometricEnrolled
     }
 
-    val response = biometricManager.canAuthenticate(
-      BIOMETRIC_STRONG or BIOMETRIC_WEAK
-    )
+    val response = biometricManager.canAuthenticate(BIOMETRIC_STRONG or BIOMETRIC_WEAK)
     return CanAuthenticateResponse.values().firstOrNull { it.code == response }
-      ?: throw Exception(
-        "Unknown response code {$response} (available: ${
+        ?: throw Exception(
+            "Unknown response code {$response} (available: ${
           CanAuthenticateResponse
             .values()
             .contentToString()
         }"
-      )
+        )
+  }
+
+
+  @UiThread
+  private fun authenticate(
+      cipher: Cipher?,
+      promptInfo: AndroidPromptInfo,
+      options: InitOptions,
+      @WorkerThread onSuccess: (cipher: Cipher?) -> Unit,
+      onError: ErrorCallback
+  ) {
+    logger.trace { "authenticate()" }
+    val activity =
+        attachedActivity
+            ?: return run {
+              logger.error { "We are not attached to an activity." }
+              onError(
+                  AuthenticationErrorInfo(
+                      AuthenticationError.Failed,
+                      "Plugin not attached to any activity."
+                  )
+              )
+            }
+    val prompt =
+        BiometricPrompt(
+            activity,
+            executor,
+            object : BiometricPrompt.AuthenticationCallback() {
+              override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
+                logger.trace { "onAuthenticationError($errorCode, $errString)" }
+                ui(onError) {
+                  onError(
+                      AuthenticationErrorInfo(AuthenticationError.forCode(errorCode), errString)
+                  )
+                }
+              }
+
+              @WorkerThread
+              override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
+                logger.trace { "onAuthenticationSucceeded($result)" }
+                worker(onError) { onSuccess(result.cryptoObject?.cipher) }
+              }
+
+              override fun onAuthenticationFailed() {
+                logger.trace { "onAuthenticationFailed()" }
+                // this just means the user was not recognised, but the O/S will handle feedback so
+                // we don't have to
+              }
+            }
+        )
+
+    val promptBuilder =
+        BiometricPrompt.PromptInfo.Builder()
+            .setTitle(promptInfo.title)
+            .setSubtitle(promptInfo.subtitle)
+            .setDescription(promptInfo.description)
+            .setConfirmationRequired(promptInfo.confirmationRequired)
+
+    val biometricOnly =
+        options.androidBiometricOnly || Build.VERSION.SDK_INT < Build.VERSION_CODES.R
+
+    if (biometricOnly) {
+      if (!options.androidBiometricOnly) {
+        logger.debug {
+          "androidBiometricOnly was false, but prior " +
+              "to ${Build.VERSION_CODES.R} this was not supported. ignoring."
+        }
+      }
+      promptBuilder
+          .setAllowedAuthenticators(BIOMETRIC_STRONG)
+          .setNegativeButtonText(promptInfo.negativeButton)
+    } else {
+      promptBuilder.setAllowedAuthenticators(DEVICE_CREDENTIAL or BIOMETRIC_STRONG)
+    }
+
+    if (cipher == null || options.androidAuthenticationValidityDuration != null) {
+      // if androidAuthenticationValidityDuration is not null we can't use a CryptoObject
+      logger.debug {
+        "Authenticating without cipher. ${options.androidAuthenticationValidityDuration}"
+      }
+      prompt.authenticate(promptBuilder.build())
+    } else {
+      prompt.authenticate(promptBuilder.build(), BiometricPrompt.CryptoObject(cipher))
+    }
   }
 
   override fun onDetachedFromActivity() {
@@ -330,15 +435,11 @@ class LocalBiometricAuthPlugin: FlutterPlugin, ActivityAware, MethodCallHandler 
     attachedActivity = null
   }
 
-  override fun onReattachedToActivityForConfigChanges(binding: ActivityPluginBinding) {
-  }
+  override fun onReattachedToActivityForConfigChanges(binding: ActivityPluginBinding) {}
 
   override fun onAttachedToActivity(binding: ActivityPluginBinding) {
     logger.debug { "Attached to new activity." }
     updateAttachedActivity(binding.activity)
-  }
-
-  override fun onDetachedFromActivityForConfigChanges() {
   }
 
   private fun updateAttachedActivity(activity: Activity) {
@@ -349,4 +450,13 @@ class LocalBiometricAuthPlugin: FlutterPlugin, ActivityAware, MethodCallHandler 
     attachedActivity = activity
   }
 
+  override fun onDetachedFromActivityForConfigChanges() {}
 }
+
+data class AndroidPromptInfo(
+    val title: String,
+    val subtitle: String?,
+    val description: String?,
+    val negativeButton: String,
+    val confirmationRequired: Boolean
+)

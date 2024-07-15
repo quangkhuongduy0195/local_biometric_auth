@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
@@ -7,6 +8,10 @@ import 'package:plugin_platform_interface/plugin_platform_interface.dart';
 
 final _logger = Logger('local_biometric_auth');
 
+/// Reason for not supporting authentication.
+/// **As long as this is NOT [unsupported] you can still use the secure
+/// storage without biometric storage** (By setting
+/// [StorageFileInitOptions.authenticationRequired] to `false`).
 enum CanAuthenticateResponse {
   success,
   errorHwUnavailable,
@@ -45,14 +50,12 @@ enum AuthExceptionCode {
   unknown,
   timeout,
   linuxAppArmorDenied,
-  block,
 }
 
 const _authErrorCodeMapping = {
   'AuthError:UserCanceled': AuthExceptionCode.userCanceled,
   'AuthError:Canceled': AuthExceptionCode.canceled,
   'AuthError:Timeout': AuthExceptionCode.timeout,
-  'AuthError:Block': AuthExceptionCode.block,
 };
 
 class BiometricStorageException implements Exception {
@@ -222,18 +225,18 @@ class PromptInfo {
 /// factory constructor will always return the same instance.
 ///
 /// * call [canAuthenticate] to check support on the platform/device.
-/// * call [init] to initialize a storage.
-abstract class LocalBiometricAuth extends PlatformInterface {
+/// * call [getStorage] to initialize a storage.
+abstract class BiometricStorage extends PlatformInterface {
   // Returns singleton instance.
-  factory LocalBiometricAuth() => _instance;
+  factory BiometricStorage() => _instance;
 
-  LocalBiometricAuth.create() : super(token: _token);
+  BiometricStorage.create() : super(token: _token);
 
-  static LocalBiometricAuth _instance = MethodChannelBiometricStorage();
+  static BiometricStorage _instance = MethodChannelBiometricStorage();
 
   /// Platform-specific plugins should set this with their own platform-specific
   /// class that extends [UrlLauncherPlatform] when they register themselves.
-  static set instance(LocalBiometricAuth instance) {
+  static set instance(BiometricStorage instance) {
     PlatformInterface.verifyToken(instance, _token);
     _instance = instance;
   }
@@ -244,17 +247,36 @@ abstract class LocalBiometricAuth extends PlatformInterface {
   /// the reason [CanAuthenticateResponse] why it is not supported.
   Future<CanAuthenticateResponse> canAuthenticate();
 
+  /// Returns true when there is an AppArmor error when trying to read a value.
+  ///
+  /// When used inside a snap, there might be app armor limitations
+  /// which lead to an error like:
+  /// org.freedesktop.DBus.Error.AccessDenied: An AppArmor policy prevents
+  /// this sender from sending this message to this recipient;
+  /// type="method_call", sender=":1.140" (uid=1000 pid=94358
+  /// comm="/snap/biometric-storage-example/x1/biometric_stora"
+  /// label="snap.biometric-storage-example.biometric (enforce)")
+  /// interface="org.freedesktop.Secret.Service" member="OpenSession"
+  /// error name="(unset)" requested_reply="0" destination=":1.30"
+  /// (uid=1000 pid=1153 comm="/usr/bin/gnome-keyring-daemon
+  /// --daemonize --login " label="unconfined")
+  Future<bool> linuxCheckAppArmorError();
+
   /// Retrieves the given biometric storage file.
   /// Each store is completely separated, and has it's own encryption and
   /// biometric lock.
   /// if [forceInit] is true, will throw an exception if the store was already
   /// created in this runtime.
-  Future<BiometricStorage> init(String name);
+  Future<BiometricStorageFile> getStorage(
+    String name, {
+    StorageFileInitOptions? options,
+    bool forceInit = false,
+    PromptInfo promptInfo = PromptInfo.defaultValues,
+  });
 
   @protected
-  Future<String?> decryptData(
+  Future<String?> read(
     String name,
-    String data,
     PromptInfo promptInfo,
   );
 
@@ -265,17 +287,17 @@ abstract class LocalBiometricAuth extends PlatformInterface {
   );
 
   @protected
-  Future<String?> encryptData(
+  Future<void> write(
     String name,
     String content,
     PromptInfo promptInfo,
   );
 }
 
-class MethodChannelBiometricStorage extends LocalBiometricAuth {
+class MethodChannelBiometricStorage extends BiometricStorage {
   MethodChannelBiometricStorage() : super.create();
 
-  final _channel = const MethodChannel('local_biometric_auth');
+  static const MethodChannel _channel = MethodChannel('local_biometric_auth');
 
   @override
   Future<CanAuthenticateResponse> canAuthenticate() async {
@@ -296,23 +318,68 @@ class MethodChannelBiometricStorage extends LocalBiometricAuth {
     return CanAuthenticateResponse.unsupported;
   }
 
+  /// Returns true when there is an AppArmor error when trying to read a value.
+  ///
+  /// When used inside a snap, there might be app armor limitations
+  /// which lead to an error like:
+  /// org.freedesktop.DBus.Error.AccessDenied: An AppArmor policy prevents
+  /// this sender from sending this message to this recipient;
+  /// type="method_call", sender=":1.140" (uid=1000 pid=94358
+  /// comm="/snap/biometric-storage-example/x1/biometric_stora"
+  /// label="snap.biometric-storage-example.biometric (enforce)")
+  /// interface="org.freedesktop.Secret.Service" member="OpenSession"
+  /// error name="(unset)" requested_reply="0" destination=":1.30"
+  /// (uid=1000 pid=1153 comm="/usr/bin/gnome-keyring-daemon
+  /// --daemonize --login " label="unconfined")
+  @override
+  Future<bool> linuxCheckAppArmorError() async {
+    if (!Platform.isLinux) {
+      return false;
+    }
+    final tmpStorage = await getStorage('appArmorCheck',
+        options: StorageFileInitOptions(authenticationRequired: false));
+    _logger.finer('Checking app armor');
+    try {
+      await tmpStorage.read();
+      _logger.finer('Everything okay.');
+      return false;
+    } on AuthException catch (e, stackTrace) {
+      if (e.code == AuthExceptionCode.linuxAppArmorDenied) {
+        return true;
+      }
+      _logger.warning(
+          'Unknown error while checking for app armor.', e, stackTrace);
+      // some other weird error?
+      rethrow;
+    }
+  }
+
   /// Retrieves the given biometric storage file.
   /// Each store is completely separated, and has it's own encryption and
   /// biometric lock.
   /// if [forceInit] is true, will throw an exception if the store was already
   /// created in this runtime.
   @override
-  Future<BiometricStorage> init(String name) async {
+  Future<BiometricStorageFile> getStorage(
+    String name, {
+    StorageFileInitOptions? options,
+    bool forceInit = false,
+    PromptInfo promptInfo = PromptInfo.defaultValues,
+  }) async {
     try {
       final result = await _channel.invokeMethod<bool>(
         'init',
-        {'name': name},
+        {
+          'name': name,
+          'options': options?.toJson() ?? StorageFileInitOptions().toJson(),
+          'forceInit': forceInit,
+        },
       );
       _logger.finest('getting storage. was created: $result');
-      return BiometricStorage(
+      return BiometricStorageFile(
         this,
         name,
-        PromptInfo.defaultValues,
+        promptInfo,
       );
     } catch (e, stackTrace) {
       _logger.warning(
@@ -322,14 +389,12 @@ class MethodChannelBiometricStorage extends LocalBiometricAuth {
   }
 
   @override
-  Future<String?> decryptData(
+  Future<String?> read(
     String name,
-    String data,
     PromptInfo promptInfo,
   ) =>
       _transformErrors(_channel.invokeMethod<String>('read', <String, dynamic>{
         'name': name,
-        'content': data,
         ..._promptInfoForCurrentPlatform(promptInfo),
       }));
 
@@ -344,7 +409,7 @@ class MethodChannelBiometricStorage extends LocalBiometricAuth {
       }));
 
   @override
-  Future<String?> encryptData(
+  Future<void> write(
     String name,
     String content,
     PromptInfo promptInfo,
@@ -412,21 +477,21 @@ class MethodChannelBiometricStorage extends LocalBiometricAuth {
       });
 }
 
-class BiometricStorage {
-  BiometricStorage(this._plugin, this.name, this.defaultPromptInfo);
+class BiometricStorageFile {
+  BiometricStorageFile(this._plugin, this.name, this.defaultPromptInfo);
 
-  final LocalBiometricAuth _plugin;
+  final BiometricStorage _plugin;
   final String name;
   final PromptInfo defaultPromptInfo;
 
   /// read from the secure file and returns the content.
   /// Will return `null` if file does not exist.
-  Future<String?> decryptData(String data, {PromptInfo? promptInfo}) =>
-      _plugin.decryptData(name, data, promptInfo ?? defaultPromptInfo);
+  Future<String?> read({PromptInfo? promptInfo}) =>
+      _plugin.read(name, promptInfo ?? defaultPromptInfo);
 
   /// Write content of this file. Previous value will be overwritten.
-  Future<String?> encryptData(String content, {PromptInfo? promptInfo}) =>
-      _plugin.encryptData(name, content, promptInfo ?? defaultPromptInfo);
+  Future<void> write(String content, {PromptInfo? promptInfo}) =>
+      _plugin.write(name, content, promptInfo ?? defaultPromptInfo);
 
   /// Delete the content of this storage.
   Future<void> delete({PromptInfo? promptInfo}) =>

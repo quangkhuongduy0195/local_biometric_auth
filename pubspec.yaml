@@ -1,7 +1,7 @@
 name: local_biometric_auth
 description: "local biometric auth"
-version: 0.0.1
-homepage:
+version: 0.0.4
+homepage: https://github.com/quangkhuongduy0195/local_biometric_auth
 
 environment:
   sdk: '>=3.4.3 <4.0.0'

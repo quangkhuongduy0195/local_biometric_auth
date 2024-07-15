@@ -1,32 +1,18 @@
 import android.os.Build
 import android.security.keystore.KeyGenParameterSpec
-import android.security.keystore.KeyPermanentlyInvalidatedException
 import android.security.keystore.KeyProperties
 import androidx.annotation.RequiresApi
-import com.duyqk.local_biometric_auth.CipherMode
+import io.github.oshai.kotlinlogging.KotlinLogging
+import java.io.File
 import java.nio.charset.Charset
 import java.security.KeyStore
+import java.security.KeyStoreException
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
-import javax.crypto.spec.IvParameterSpec
 
-/**
- * Copyright (C) 2020 Google Inc. All Rights Reserved.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *      http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+private val logger = KotlinLogging.logger {}
 
 interface CryptographyManager {
 
@@ -34,13 +20,14 @@ interface CryptographyManager {
      * This method first gets or generates an instance of SecretKey and then initializes the Cipher
      * with the key. The secret key uses [ENCRYPT_MODE][Cipher.ENCRYPT_MODE] is used.
      */
-    fun getInitializedCipherForEncryption(keyName: String, iv: ByteArray): Cipher
+    fun getInitializedCipherForEncryption(keyName: String): Cipher
 
     /**
      * This method first gets or generates an instance of SecretKey and then initializes the Cipher
      * with the key. The secret key uses [DECRYPT_MODE][Cipher.DECRYPT_MODE] is used.
      */
     fun getInitializedCipherForDecryption(keyName: String, initializationVector: ByteArray): Cipher
+    fun getInitializedCipherForDecryption(keyName: String, encryptedDataFile: File): Cipher
 
     /**
      * The Cipher created with [getInitializedCipherForEncryption] is used here
@@ -52,101 +39,129 @@ interface CryptographyManager {
      */
     fun decryptData(ciphertext: ByteArray, cipher: Cipher): String
 
-    fun delete(keyName: String)
 }
 
-fun CryptographyManager(): CryptographyManager = CryptographyManagerImpl()
+fun CryptographyManager(configure: KeyGenParameterSpec.Builder.() -> Unit): CryptographyManagerImpl = CryptographyManagerImpl(configure)
 
-data class EncryptedData(val ciphertext: ByteArray, val initializationVector: ByteArray)
+@Suppress("ArrayInDataClass")
+data class EncryptedData(val encryptedPayload: ByteArray)
 
-private class CryptographyManagerImpl : CryptographyManager {
+class CryptographyManagerImpl(
+    private val configure: KeyGenParameterSpec.Builder.() -> Unit
+) :
+    CryptographyManager {
 
-    private val KEY_SIZE: Int = 256
-    val ANDROID_KEYSTORE = "AndroidKeyStore"
-    private val ENCRYPTION_BLOCK_MODE = KeyProperties.BLOCK_MODE_CBC
-    private val ENCRYPTION_PADDING = KeyProperties.ENCRYPTION_PADDING_PKCS7
-    private val ENCRYPTION_ALGORITHM = KeyProperties.KEY_ALGORITHM_AES
+    companion object {
+
+        private const val KEY_SIZE: Int = 256
+
+        /**
+         * Prefix for the key name, to distinguish it from previously written key.
+         * kind of namespacing it.
+         */
+        private const val KEY_PREFIX = "_CM_"
+        const val ANDROID_KEYSTORE = "AndroidKeyStore"
+        private const val ENCRYPTION_BLOCK_MODE = KeyProperties.BLOCK_MODE_GCM
+        private const val ENCRYPTION_PADDING = KeyProperties.ENCRYPTION_PADDING_NONE
+        private const val ENCRYPTION_ALGORITHM = KeyProperties.KEY_ALGORITHM_AES
+
+        private const val IV_SIZE_IN_BYTES = 12
+        private const val TAG_SIZE_IN_BYTES = 16
+
+    }
 
     @RequiresApi(Build.VERSION_CODES.M)
-    override fun getInitializedCipherForEncryption(keyName: String, iv: ByteArray): Cipher {
+    override fun getInitializedCipherForEncryption(keyName: String): Cipher {
         val cipher = getCipher()
         val secretKey = getOrCreateSecretKey(keyName)
-        try {
-            cipher.init(Cipher.ENCRYPT_MODE, secretKey, IvParameterSpec(iv))
-        }
-        catch (e : KeyPermanentlyInvalidatedException) {
-            val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE)
-            keyStore.deleteEntry(keyName)
-        }
+        cipher.init(Cipher.ENCRYPT_MODE, secretKey)
         return cipher
     }
 
     @RequiresApi(Build.VERSION_CODES.M)
-    override fun getInitializedCipherForDecryption(keyName: String, iv: ByteArray): Cipher {
+    override fun getInitializedCipherForDecryption(
+        keyName: String,
+        initializationVector: ByteArray
+    ): Cipher {
         val cipher = getCipher()
         val secretKey = getOrCreateSecretKey(keyName)
-        try {
-            cipher.init(Cipher.DECRYPT_MODE, secretKey, IvParameterSpec(iv))
-        }
-        catch (e : KeyPermanentlyInvalidatedException) {
-            val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE)
-            keyStore.deleteEntry(keyName)
-        }
+        cipher.init(Cipher.DECRYPT_MODE, secretKey, GCMParameterSpec(TAG_SIZE_IN_BYTES * 8, initializationVector))
         return cipher
+    }
+    @RequiresApi(Build.VERSION_CODES.M)
+    override fun getInitializedCipherForDecryption(
+        keyName: String,
+        encryptedDataFile: File,
+    ): Cipher {
+        val iv = ByteArray(IV_SIZE_IN_BYTES)
+        val count = encryptedDataFile.inputStream().read(iv)
+        assert(count == IV_SIZE_IN_BYTES)
+        return getInitializedCipherForDecryption(keyName, iv)
     }
 
     override fun encryptData(plaintext: String, cipher: Cipher): EncryptedData {
-        val encryptedData = Charset.forName("UTF-8")
-        val encryptedBytes = cipher.doFinal(plaintext.toByteArray(encryptedData))
-        val iv = cipher.iv
-        val r = ByteArray(iv.size + encryptedBytes.size)
-        System.arraycopy(iv, 0, r, 0, iv.size)
-        System.arraycopy(encryptedBytes, 0, r, iv.size, encryptedBytes.size)
-        return EncryptedData(r,cipher.iv)
+        val input = plaintext.toByteArray(Charsets.UTF_8)
+        val ciphertext = ByteArray(IV_SIZE_IN_BYTES + input.size + TAG_SIZE_IN_BYTES)
+        val bytesWritten = cipher.doFinal(input, 0, input.size, ciphertext, IV_SIZE_IN_BYTES)
+        cipher.iv.copyInto(ciphertext)
+        assert(bytesWritten == input.size + TAG_SIZE_IN_BYTES)
+        assert(cipher.iv.size == IV_SIZE_IN_BYTES)
+        logger.debug { "encrypted ${input.size} (${ciphertext.size} output)" }
+//        val ciphertext = cipher.doFinal(plaintext.toByteArray(Charsets.UTF_8))
+        return EncryptedData(ciphertext)
     }
 
     override fun decryptData(ciphertext: ByteArray, cipher: Cipher): String {
-        val plaintext = cipher.doFinal(ciphertext, 16, ciphertext.size - 16)
-        val value = String(plaintext, Charset.forName("UTF-8"))
-        return value
+        logger.debug { "decrypting ${ciphertext.size} bytes (iv: ${IV_SIZE_IN_BYTES}, tag: ${TAG_SIZE_IN_BYTES})" }
+        val iv = ciphertext.sliceArray(IntRange(0, IV_SIZE_IN_BYTES - 1))
+        if (!iv.contentEquals(cipher.iv)) {
+            throw IllegalStateException("expected first bytes of ciphertext to equal cipher iv.")
+        }
+        val plaintext = cipher.doFinal(ciphertext, IV_SIZE_IN_BYTES, ciphertext.size - IV_SIZE_IN_BYTES)
+        return String(plaintext, Charset.forName("UTF-8"))
     }
-
-    override fun delete(keyName: String) {
-        val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE)
-        keyStore.deleteEntry(keyName)
-    }
-
 
     private fun getCipher(): Cipher {
         val transformation = "$ENCRYPTION_ALGORITHM/$ENCRYPTION_BLOCK_MODE/$ENCRYPTION_PADDING"
         return Cipher.getInstance(transformation)
     }
 
+    fun deleteKey(keyName: String) {
+        val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE)
+        keyStore.load(null) // Keystore must be loaded before it can be accessed
+        try {
+            keyStore.deleteEntry(KEY_PREFIX + keyName)
+        } catch (e: KeyStoreException) {
+            logger.warn(e) { "Unable to delete key from KeyStore $KEY_PREFIX$keyName" }
+        }
+    }
+
     @RequiresApi(Build.VERSION_CODES.M)
     private fun getOrCreateSecretKey(keyName: String): SecretKey {
+        val realKeyName = KEY_PREFIX + keyName
         // If Secretkey was previously created for that keyName, then grab and return it.
         val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE)
         keyStore.load(null) // Keystore must be loaded before it can be accessed
-        keyStore.getKey(keyName, null)?.let { return it as SecretKey }
+        keyStore.getKey(realKeyName, null)?.let { return it as SecretKey }
 
         // if you reach here, then a new SecretKey must be generated for that keyName
-        val paramsBuilder = KeyGenParameterSpec.Builder(keyName,
-            KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT)
+        val paramsBuilder = KeyGenParameterSpec.Builder(
+            realKeyName,
+            KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT
+        )
         paramsBuilder.apply {
             setBlockModes(ENCRYPTION_BLOCK_MODE)
             setEncryptionPaddings(ENCRYPTION_PADDING)
-            setRandomizedEncryptionRequired(false)
+            setKeySize(KEY_SIZE)
             setUserAuthenticationRequired(true)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                setInvalidatedByBiometricEnrollment(true)
-            }
-//            setKeySize(KEY_SIZE)
+            configure()
         }
 
         val keyGenParams = paramsBuilder.build()
         val keyGenerator = KeyGenerator.getInstance(
             KeyProperties.KEY_ALGORITHM_AES,
-            ANDROID_KEYSTORE)
+            ANDROID_KEYSTORE
+        )
         keyGenerator.init(keyGenParams)
         return keyGenerator.generateKey()
     }

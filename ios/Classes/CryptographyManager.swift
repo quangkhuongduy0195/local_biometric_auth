@@ -142,11 +142,16 @@ class CryptographyManager {
         parameters[kSecPrivateKeyAttrs] = privateKeyParameters as AnyObject
         
         var publicKey, privateKey: SecKey?
-        let status = SecKeyGeneratePair(parameters as CFDictionary, &publicKey, &privateKey)
-     
-        guard status == errSecSuccess else {
-            print("Error generating key pair: \(status)")
-            return (nil, nil)
+        var error: Unmanaged<CFError>?
+        if #available(iOS 15.0, *) {
+            privateKey = SecKeyCreateRandomKey(parameters as CFDictionary, &error)
+            publicKey = SecKeyCopyPublicKey(privateKey!)!
+        } else {
+            let status = SecKeyGeneratePair(parameters as CFDictionary, &publicKey, &privateKey)
+            guard status == errSecSuccess else {
+                print("Error generating key pair: \(status)")
+                return (nil, nil)
+            }
         }
         return (publicKey, privateKey)
     }
